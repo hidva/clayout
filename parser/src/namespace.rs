@@ -2,7 +2,7 @@ use std::cmp;
 use std::sync::Arc;
 
 /// A namespace kind.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum NamespaceKind {
     /// An explicit namespace.
     Namespace,

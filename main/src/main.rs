@@ -1,728 +1,1131 @@
-// Enable some rust 2018 idioms.
-#![warn(bare_trait_objects)]
-#![warn(unused_extern_crates)]
+use clap::Parser;
+use log::{info, warn};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-#[cfg(feature = "system_alloc")]
-use std::alloc::System;
+const BITS_PER_BYTE: u64 = 8;
 
-#[cfg(feature = "system_alloc")]
-#[global_allocator]
-static A: System = System;
+fn bit2byte(input: u64) -> u64 {
+    (input + BITS_PER_BYTE - 1) / BITS_PER_BYTE
+}
+static ID_GENERATOR: AtomicU64 = AtomicU64::new(0);
+fn uniq_id() -> u64 {
+    ID_GENERATOR.fetch_add(1, Relaxed)
+}
 
-#[macro_use]
-extern crate log;
+// ns1::ns2::ns3::Typ => [ns1, ns2, ns3, Typ]
+fn parse_typename(input: &str) -> anyhow::Result<Vec<String>> {
+    Ok(input.split("::").map(|v| v.to_string()).collect())
+}
 
-use std::convert::Infallible;
-use std::io::{BufWriter, Write};
-use std::net::SocketAddr;
-use std::str;
-use std::sync::Arc;
+#[derive(Parser)]
+#[clap(author, version, about)]
+struct Args {
+    /// input so path, can specify more than once
+    #[arg(short = 'i')]
+    so_path: Vec<String>,
 
-use hyper::server::conn::{AddrIncoming, AddrStream};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+    /// input file path, each line represents a so path, can specify more than once
+    #[arg(short = 'I')]
+    so_file_path: Vec<String>,
 
-// Mode
-const OPT_FILE: &str = "file";
-const OPT_DIFF: &str = "diff";
-const OPT_BLOAT: &str = "bloat";
+    /// output file path
+    #[arg(short)]
+    out_path: String,
 
-// Print format
-const OPT_OUTPUT: &str = "format";
-const OPT_OUTPUT_TEXT: &str = "text";
-const OPT_OUTPUT_HTML: &str = "html";
-const OPT_OUTPUT_HTTP: &str = "http";
+    /// type name, such as 'namespace1::namespace2::TypeName'
+    #[arg(value_parser=parse_typename)]
+    dest: Vec<Vec<String>>,
+}
 
-// Print categories
-const OPT_CATEGORY: &str = "category";
-const OPT_CATEGORY_FILE: &str = "file";
-const OPT_CATEGORY_UNIT: &str = "unit";
-const OPT_CATEGORY_TYPE: &str = "type";
-const OPT_CATEGORY_FUNCTION: &str = "function";
-const OPT_CATEGORY_VARIABLE: &str = "variable";
-
-// Print fields
-const OPT_PRINT: &str = "print";
-const OPT_PRINT_ALL: &str = "all";
-const OPT_PRINT_ADDRESS: &str = "address";
-const OPT_PRINT_SOURCE: &str = "source";
-const OPT_PRINT_FILE_ADDRESS: &str = "file-address";
-const OPT_PRINT_UNIT_ADDRESS: &str = "unit-address";
-const OPT_PRINT_FUNCTION_CALLS: &str = "function-calls";
-const OPT_PRINT_FUNCTION_INSTRUCTIONS: &str = "function-instructions";
-const OPT_PRINT_FUNCTION_VARIABLES: &str = "function-variables";
-const OPT_PRINT_FUNCTION_STACK_FRAME: &str = "function-stack-frame";
-const OPT_PRINT_INLINED_FUNCTION_PARAMETERS: &str = "inlined-function-parameters";
-const OPT_PRINT_VARIABLE_LOCATIONS: &str = "variable-locations";
-
-// Print parameters
-const OPT_INLINE_DEPTH: &str = "inline-depth";
-
-// Filters
-const OPT_FILTER: &str = "filter";
-const OPT_FILTER_INLINE: &str = "inline";
-const OPT_FILTER_FUNCTION_INLINE: &str = "function-inline";
-const OPT_FILTER_NAME: &str = "name";
-const OPT_FILTER_NAMESPACE: &str = "namespace";
-const OPT_FILTER_UNIT: &str = "unit";
-
-// Sorting
-const OPT_SORT: &str = "sort";
-const OPT_SORT_SIZE: &str = "size";
-const OPT_SORT_NAME: &str = "name";
-
-// Diff options
-const OPT_IGNORE: &str = "ignore";
-const OPT_IGNORE_ADDED: &str = "added";
-const OPT_IGNORE_DELETED: &str = "deleted";
-const OPT_IGNORE_ADDRESS: &str = "address";
-const OPT_IGNORE_LINKAGE_NAME: &str = "linkage-name";
-const OPT_IGNORE_SYMBOL_NAME: &str = "symbol-name";
-const OPT_IGNORE_FUNCTION_ADDRESS: &str = "function-address";
-const OPT_IGNORE_FUNCTION_SIZE: &str = "function-size";
-const OPT_IGNORE_FUNCTION_INLINE: &str = "function-inline";
-const OPT_IGNORE_FUNCTION_SYMBOL_NAME: &str = "function-symbol-name";
-const OPT_IGNORE_VARIABLE_ADDRESS: &str = "variable-address";
-const OPT_IGNORE_VARIABLE_SYMBOL_NAME: &str = "variable-symbol-name";
-const OPT_PREFIX_MAP: &str = "prefix-map";
-
-fn main() {
-    env_logger::init();
-
-    let mut cmd = clap::Command::new("ddbug")
-        .version(clap::crate_version!())
-        .arg(
-            clap::Arg::new(OPT_FILE)
-                .help("Path of file to print")
-                .value_name("FILE")
-                .index(1)
-                .required_unless_present_any(&[OPT_DIFF, OPT_BLOAT])
-                .conflicts_with_all(&[OPT_DIFF, OPT_BLOAT]),
-        )
-        .arg(
-            clap::Arg::new(OPT_DIFF)
-                .short('d')
-                .long(OPT_DIFF)
-                .help("Print difference between two files")
-                .value_names(&["FILE", "FILE"])
-                .conflicts_with_all(&[OPT_BLOAT]),
-        )
-        .arg(
-            clap::Arg::new(OPT_BLOAT)
-                .long(OPT_BLOAT)
-                .help("Print bloat information")
-                .value_name("FILE")
-                .conflicts_with_all(&[OPT_DIFF]),
-        )
-        .arg(
-            clap::Arg::new(OPT_OUTPUT)
-                .short('o')
-                .long(OPT_OUTPUT)
-                .help("Output format")
-                .takes_value(true)
-                .value_name("FORMAT")
-                .possible_values(&[OPT_OUTPUT_TEXT, OPT_OUTPUT_HTML, OPT_OUTPUT_HTTP]),
-        )
-        .arg(
-            clap::Arg::new(OPT_CATEGORY)
-                .short('c')
-                .long(OPT_CATEGORY)
-                .help("Categories of entries to print (defaults to all)")
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .require_value_delimiter(true)
-                .value_name("CATEGORY")
-                .possible_values(&[
-                    OPT_CATEGORY_FILE,
-                    OPT_CATEGORY_UNIT,
-                    OPT_CATEGORY_TYPE,
-                    OPT_CATEGORY_FUNCTION,
-                    OPT_CATEGORY_VARIABLE,
-                ]),
-        )
-        .arg(
-            clap::Arg::new(OPT_PRINT)
-                .short('p')
-                .long(OPT_PRINT)
-                .help("Print extra fields within entries")
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .require_value_delimiter(true)
-                .value_name("FIELD")
-                .possible_values(&[
-                    OPT_PRINT_ALL,
-                    OPT_PRINT_ADDRESS,
-                    OPT_PRINT_SOURCE,
-                    OPT_PRINT_FILE_ADDRESS,
-                    OPT_PRINT_UNIT_ADDRESS,
-                    OPT_PRINT_FUNCTION_CALLS,
-                    OPT_PRINT_FUNCTION_INSTRUCTIONS,
-                    OPT_PRINT_FUNCTION_VARIABLES,
-                    OPT_PRINT_FUNCTION_STACK_FRAME,
-                    OPT_PRINT_INLINED_FUNCTION_PARAMETERS,
-                    OPT_PRINT_VARIABLE_LOCATIONS,
-                ]),
-        )
-        .arg(
-            clap::Arg::new(OPT_INLINE_DEPTH)
-                .long(OPT_INLINE_DEPTH)
-                .help("Depth of inlined function calls to print (defaults to 1, 0 to disable)")
-                .value_name("DEPTH"),
-        )
-        .arg(
-            clap::Arg::new(OPT_FILTER)
-                .short('f')
-                .long(OPT_FILTER)
-                .help("Print only entries that match the given filters")
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .require_value_delimiter(true)
-                .value_name("FILTER"),
-        )
-        .arg(
-            clap::Arg::new(OPT_SORT)
-                .short('s')
-                .long(OPT_SORT)
-                .help("Sort entries by the given key")
-                .takes_value(true)
-                .value_name("KEY")
-                .possible_values(&[OPT_SORT_NAME, OPT_SORT_SIZE]),
-        )
-        .arg(
-            clap::Arg::new(OPT_IGNORE)
-                .short('i')
-                .long(OPT_IGNORE)
-                .help("Don't print differences due to the given types of changes")
-                .requires(OPT_DIFF)
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .require_value_delimiter(true)
-                .value_name("CHANGE")
-                .possible_values(&[
-                    OPT_IGNORE_ADDED,
-                    OPT_IGNORE_DELETED,
-                    OPT_IGNORE_ADDRESS,
-                    OPT_IGNORE_LINKAGE_NAME,
-                    OPT_IGNORE_SYMBOL_NAME,
-                    OPT_IGNORE_FUNCTION_ADDRESS,
-                    OPT_IGNORE_FUNCTION_SIZE,
-                    OPT_IGNORE_FUNCTION_INLINE,
-                    OPT_IGNORE_FUNCTION_SYMBOL_NAME,
-                    OPT_IGNORE_VARIABLE_ADDRESS,
-                    OPT_IGNORE_VARIABLE_SYMBOL_NAME,
-                ]),
-        )
-        .arg(
-            clap::Arg::new(OPT_PREFIX_MAP)
-                .long(OPT_PREFIX_MAP)
-                .help("When comparing file paths, replace the 'old' prefix with the 'new' prefix")
-                .requires(OPT_DIFF)
-                .takes_value(true)
-                .multiple_occurrences(true)
-                .require_value_delimiter(true)
-                .value_name("OLD>=<NEW"),
-        )
-        .after_help(concat!(
-            "FILTERS:\n",
-            "    function-inline=<yes|no>        Match function 'inline' value\n",
-            "    name=<string>                   Match entries with the given name\n",
-            "    namespace=<string>              Match entries within the given namespace\n",
-            "    unit=<string>                   Match entries within the given unit\n"
-        ));
-    let matches = cmd.get_matches_mut();
-
-    let mut options = ddbug::Options::default();
-    options.inline_depth = 1;
-
-    if let Some(value) = matches.value_of(OPT_OUTPUT) {
-        match value {
-            OPT_OUTPUT_TEXT => options.html = false,
-            OPT_OUTPUT_HTML => options.html = true,
-            OPT_OUTPUT_HTTP => {
-                options.html = true;
-                options.http = true;
-                options.inline_depth = 100;
-                options.print_source = true;
-                options.print_function_calls = true;
-                options.print_function_instructions = true;
+impl Args {
+    fn is_dest(&self, tyn: &parser::TypeName) -> bool {
+        for d in &self.dest {
+            if tyn.ends_with(&d) {
+                return true;
             }
-            _ => cmd
-                .error(
-                    clap::ErrorKind::InvalidValue,
-                    format!("invalid {} value: {}", OPT_OUTPUT, value),
-                )
-                .exit(),
+        }
+        return false;
+    }
+}
+
+fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<std::fs::File>>>
+where
+    P: AsRef<std::path::Path>,
+{
+    let file = std::fs::File::open(filename)?;
+    Ok(io::BufReader::new(file).lines())
+}
+
+// is_declaration 意味着 ty 中并没有存放任何有效信息,
+fn is_declaration(ty: &parser::Type) -> bool {
+    match ty.kind() {
+        parser::TypeKind::Struct(s) => s.is_declaration(),
+        parser::TypeKind::Union(s) => s.is_declaration(),
+        parser::TypeKind::Enumeration(s) => s.is_declaration(),
+        parser::TypeKind::Unspecified(_) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
+struct TypeIndex {
+    // input_id 是 inputs_hash 中的偏移,
+    input_id: usize,
+    typoff: parser::TypeOffset,
+}
+
+// 我们要自己处理 padding. 会对每一个 struct/union 使用 packed __attribute__,
+// 原因如下例子:
+// struct S1218 {
+//   long l;
+//   ch c;
+// };
+//
+// struct A1218: public S1218 {
+//   // 是的, 这里 A.i 实际上是放在 S padding 部分中的.
+//   // S off=0, size=16
+//   // i off=12, size=4
+//   int i;
+// }
+#[derive(Debug)]
+struct TypeInfo {
+    // name 可以用在 C 语言作为变量类型名.
+    name: String,
+    // packed size 是使用 attribute packed 之后的 size,
+    // size 为 dwarf 中记录的 type size.
+    // 以 S1218 为例, packed_size = 9, size = 16.
+    packed_size: u64,
+    size: u64,
+}
+
+type ProcessState = HashMap<TypeIndex, Option<Rc<TypeInfo>>>;
+
+struct Printer {
+    h_file: std::fs::File,
+    c_file: std::fs::File,
+}
+
+impl Printer {
+    fn do_add_eq_assert(&mut self, expr: &str, size: u64) -> io::Result<()> {
+        writeln!(self.c_file, "  ZHANYI_HIDVA_ASSERT_EQ({}, {});", expr, size)
+    }
+}
+impl Printer {
+    fn try_open(path: &str) -> io::Result<Printer> {
+        const ASSERT_EQ_DEF: &'static str = r###"
+#define ZHANYI_HIDVA_ASSERT_EQ(a, e) do {    \
+    int actual_size = (a);  \
+    int expect_size = (e);  \
+    if (actual_size != expect_size) {   \
+        fprintf(stderr, "ASSERT FAILED! actual: %s, which is %d; expect: %s, which is %d\n", #a, actual_size, #e, expect_size);    \
+        abort();    \
+    }   \
+} while(0)
+        "###;
+        let mut h_file_name = path.to_string();
+        h_file_name.push_str(".h");
+        let mut c_file_name = path.to_string();
+        c_file_name.push_str(".c");
+        let mut h_file = std::fs::File::create(&h_file_name)?;
+        let mut c_file = std::fs::File::create(c_file_name)?;
+        writeln!(h_file, "// Generated by hidva/clayout! 大吉大利!")?;
+        writeln!(h_file, "#pragma once")?;
+        writeln!(h_file, "#include <linux/types.h>")?;
+        writeln!(c_file, "// Generated by hidva/clayout! 大吉大利!")?;
+        writeln!(c_file, "#include <stdio.h>")?;
+        writeln!(c_file, "#include <stdlib.h>")?;
+        writeln!(c_file, "#include \"{}\"", &h_file_name)?;
+        writeln!(c_file, "\n\n\n")?;
+        writeln!(c_file, "{}", ASSERT_EQ_DEF)?;
+        writeln!(c_file, "\n\n\n")?;
+        writeln!(c_file, "int main() {{")?;
+        Ok(Printer { h_file, c_file })
+    }
+
+    fn add_eq_assert(&mut self, expr: &str, size: u64) -> io::Result<()> {
+        self.do_add_eq_assert(expr, size)?;
+        writeln!(self.c_file, "")
+    }
+
+    fn add_eq_asserts(&mut self, asserts: &[EqAssert]) -> io::Result<()> {
+        for eq_assert in asserts {
+            self.do_add_eq_assert(&eq_assert.expr, eq_assert.val)?;
+        }
+        writeln!(self.c_file, "")
+    }
+
+    fn add_type(&mut self, lines: &[String]) -> io::Result<()> {
+        for l in lines {
+            writeln!(self.h_file, "{}", l)?;
+        }
+        writeln!(self.h_file, "")?;
+        writeln!(self.h_file, "")?;
+        return Ok(());
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        writeln!(self.c_file, "  return 0;")?;
+        writeln!(self.c_file, "}}")?;
+        Ok(())
+    }
+}
+
+struct Member {
+    off: u64,
+    len: u64,
+    // def, 形如 `__u8 __padding33[3]`; field_name 形如 __padding33.
+    field_name: String,
+    // 没有包含结尾分号.
+    def: String,
+    // comment 可能包含多行, 在最终输出, 确保每行都以 '//' 开头.
+    comment: String,
+    is_padding: bool, // 仅有 new_padding() 可以设置为 true.
+}
+
+impl Member {
+    // 输出到 def 时会 2 个空格缩进.
+    fn print(&self, tyname: &str, def: &mut Vec<String>, asserts: &mut Vec<EqAssert>) {
+        for comment_line in self.comment.lines() {
+            def.push(format!("  // {}", comment_line));
+        }
+        def.push(format!("  {};", &self.def));
+
+        asserts.push(EqAssert {
+            expr: format!("(long int)(&((({}*)0)->{}))", tyname, self.field_name),
+            val: self.off,
+        });
+        asserts.push(EqAssert {
+            expr: format!("sizeof((({}*)0)->{})", tyname, self.field_name),
+            val: self.len,
+        });
+    }
+
+    fn new_padding(off: u64, len: u64) -> Self {
+        let field_name = format!("__padding{}", uniq_id());
+        Self {
+            off,
+            len,
+            def: format!("__u8 {}[{}]", &field_name, len),
+            field_name,
+            comment: String::new(),
+            is_padding: true,
         }
     }
 
-    if let Some(inline_depth) = matches.value_of(OPT_INLINE_DEPTH) {
-        match inline_depth.parse::<usize>() {
-            Ok(inline_depth) => options.inline_depth = inline_depth,
-            Err(_) => {
-                cmd.error(
-                    clap::ErrorKind::InvalidValue,
-                    format!("invalid {} value: {}", OPT_INLINE_DEPTH, inline_depth),
-                )
-                .exit();
-            }
+    fn new_placeholder(off: u64, len: u64, name: &str, tylayout: Option<&parser::Layout>) -> Self {
+        let field_name = format!("{}{}", name, uniq_id());
+        Self {
+            off,
+            len,
+            def: format!("__u8 {}[{}]", &field_name, len),
+            field_name,
+            comment: tylayout
+                .map(|v| format!("{:?}", v))
+                .unwrap_or(String::new()),
+            is_padding: false,
+        }
+    }
+}
+
+// 这个函数应该作为所有查询 process state 的入口点.
+fn get_type_info(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<Option<Rc<TypeInfo>>> {
+    let tyinfo = match processed.get(&tyidx).map(|v| v.clone()) {
+        Some(i) => i,
+        None => {
+            process_type(processed, printer, tyidx, ty_max_size, inputs_hash, type_db)?;
+            processed.get(&tyidx).unwrap().clone()
+        }
+    };
+    debug_assert!(tyinfo
+        .as_ref()
+        .map(|v| v.packed_size <= v.size)
+        .unwrap_or(true));
+    if let (Some(tyinfo), Some(max_size)) = (&tyinfo, ty_max_size) {
+        assert!(tyinfo.packed_size <= max_size);
+    }
+    return Ok(tyinfo);
+}
+
+// 这里 tyidx 是 real_tyidx 的符号链接, tyidx ---> real_tyidx.
+fn handle_sym_link(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    real_tyidx: TypeIndex,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    let tyinfo = get_type_info(
+        processed,
+        printer,
+        real_tyidx,
+        ty_max_size,
+        inputs_hash,
+        type_db,
+    )?;
+    processed.insert(tyidx, tyinfo);
+    return Ok(());
+}
+
+// 找到 >= start 之后, 第一个 bit_offset 是 BYTE 边界的元素的下标, 不存在则返回 None.
+fn find_next_idx(tylayout: &Vec<parser::Layout>, start: usize) -> Option<usize> {
+    for idx in start..tylayout.len() {
+        if (tylayout[idx].bit_offset % BITS_PER_BYTE) == 0 {
+            return Some(idx);
+        }
+    }
+    return None;
+}
+
+// check ok return bit size.
+// #1 处对应的 C++ 示例:
+//   struct S {};
+//   struct F: public S { int i ; };  // 这里 F.i 与 S 具有相同的起始地址.
+// #2 处对应 C++ 示例:
+//   struct S {
+//     long l;
+//     char ch[0];  // 这里 ch bit_size None.
+//   };
+// fn check_layout(tylayout: &Vec<parser::Layout>) -> Option<u64> {
+//     let iter = tylayout.iter();
+//     let Some(mut prev) = iter.next() else {
+//         return None;
+//     };
+//     while let Some(curr) = iter.next() {
+//         let Some(prevsize) = prev.bit_size.get() else {
+//             return None;
+//         };
+//         if curr.bit_offset == prev.bit_offset ||  // #1
+//            curr.bit_offset == prev.bit_offset + prevsize
+//         {
+//             prev = curr;
+//             continue;
+//         }
+//         return None;
+//     }
+//     let prevsize = match prev.bit_size.get() {
+//         Some(v) => v,
+//         None => 0, // #2
+//     };
+//     return Some(prev.bit_offset + prevsize);
+// }
+
+// 暂时还不支持 `long l:32` 这种情况...
+fn is_bitfield(l: &parser::Layout) -> bool {
+    let Some(s) = l.bit_size.get() else {
+        return false;
+    };
+    return s % BITS_PER_BYTE != 0;
+}
+
+fn is_valid_ident(input: &str) -> bool {
+    let ret = input.trim_end_matches([
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
+        's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1',
+        '2', '3', '4', '5', '6', '7', '8', '9', '_',
+    ]);
+    return ret.is_empty();
+}
+
+fn member_name(input: Option<&str>) -> Cow<str> {
+    let Some(input) = input else {
+        return Cow::Owned(format!("__anon{}", uniq_id()));
+    };
+    if is_valid_ident(input) {
+        return Cow::Borrowed(input);
+    }
+    return Cow::Owned(format!("__mem{}", uniq_id()));
+}
+
+struct EqAssert {
+    expr: String,
+    val: u64,
+}
+
+// tydef, 形如 `union U`, `struct S` 这种,
+// tymems 最后一个 tymem off + len 为 ty_size.
+fn process_members(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    tyname: &parser::TypeName,
+    tymems: &[Member],
+    tydef: &str,
+    tysize: Option<u64>,
+) -> io::Result<()> {
+    let mut asserts = Vec::<EqAssert>::new();
+    let mut struct_def = Vec::<String>::new();
+
+    struct_def.push(format!("// tyidx={:?} tyname={}", tyidx, tyname));
+    struct_def.push(format!("{} {{", tydef));
+    for tymem in tymems {
+        tymem.print(tydef, &mut struct_def, &mut asserts);
+    }
+    struct_def.push("} __attribute__((__packed__));".to_string());
+
+    let Some(packed_size) = tymems.last().map(|v|v.off + v.len) else {
+        return Ok(());
+    };
+    asserts.push(EqAssert {
+        expr: format!("sizeof({})", tydef),
+        val: packed_size,
+    });
+
+    printer.add_type(&struct_def)?;
+    printer.add_eq_asserts(&asserts)?;
+    if let Some(tysize) = tysize {
+        processed.insert(
+            tyidx,
+            Some(Rc::new(TypeInfo {
+                name: tydef.to_string(),
+                packed_size,
+                size: tysize,
+            })),
+        );
+    }
+    return Ok(());
+}
+
+fn process_union_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty: &parser::UnionType,
+    // ty_max_size 是用来处理 C++ 中 A1218, S1218 示例展示的重用 padding 问题,
+    // union 没有这种问题, 所以可以忽略 ty_max_size.
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    if ty.is_declaration() {
+        let tyname = ty.type_name();
+        let Some(&real_tyidx) = type_db.get(&tyname) else {
+            warn!("process_union_type: unknown declaration union. typidx={:?} typname={}", tyidx, tyname);
+            return Ok(());
+        };
+        return handle_sym_link(
+            processed,
+            printer,
+            tyidx,
+            real_tyidx,
+            ty_max_size,
+            inputs_hash,
+            type_db,
+        );
+    }
+    let Some(ty_size) = ty.byte_size() else {
+        warn!("process_union_type: unknown byte size typidx={:?} typname={}", tyidx, ty.type_name());
+        return Ok(());
+    };
+    if let Some(ty_max_size) = ty_max_size {
+        if ty_size > ty_max_size {
+            warn!(
+                "process_union_type: invalid byte size typidx={:?} typname={} expect={} actual={}",
+                tyidx,
+                ty.type_name(),
+                ty_max_size,
+                ty_size
+            );
+            return Ok(());
         }
     }
 
-    if let Some(values) = matches.values_of(OPT_CATEGORY) {
-        for value in values {
-            match value {
-                OPT_CATEGORY_FILE => options.category_file = true,
-                OPT_CATEGORY_UNIT => options.category_unit = true,
-                OPT_CATEGORY_TYPE => options.category_type = true,
-                OPT_CATEGORY_FUNCTION => options.category_function = true,
-                OPT_CATEGORY_VARIABLE => options.category_variable = true,
-                _ => cmd
-                    .error(
-                        clap::ErrorKind::InvalidValue,
-                        format!("invalid {} value: {}", OPT_CATEGORY, value),
-                    )
-                    .exit(),
-            }
+    let mut tymems = Vec::<Member>::new();
+    for union_mem in ty.members() {
+        if union_mem.bit_offset() != 0 {
+            warn!(
+                "process_union_type: union_mem.bit_offset != 0! typidx={:?} typname={} member={:?}",
+                tyidx,
+                ty.type_name(),
+                union_mem
+            );
+            return Ok(());
         }
-    } else {
-        options.category_file = true;
-        options.category_unit = true;
-        options.category_type = true;
-        options.category_function = true;
-        options.category_variable = true;
+        let Some(union_mem_bit_size) = union_mem.bit_size(&inputs_hash[tyidx.input_id]) else {
+            warn!("process_union_type: unknown member size! typidx={:?} typname={} member={:?}", tyidx, ty.type_name(), union_mem);
+            return Ok(());
+        };
+        let member_size = bit2byte(union_mem_bit_size);
+        let tylayout = &parser::Layout {
+            bit_offset: 0,
+            bit_size: parser::Size::new(union_mem_bit_size),
+            item: parser::LayoutItem::Member(union_mem),
+        };
+
+        if is_bitfield(tylayout) {
+            tymems.push(Member::new_placeholder(
+                0,
+                member_size,
+                "__bitfield",
+                Some(tylayout),
+            ));
+            continue;
+        }
+
+        let member_tyoff = union_mem.type_offset();
+        let member_name = member_name(union_mem.name());
+        let mem_tyidx = TypeIndex {
+            input_id: tyidx.input_id,
+            typoff: member_tyoff,
+        };
+        let mem_tyinfo = get_type_info(
+            processed,
+            printer,
+            mem_tyidx,
+            Some(member_size),
+            inputs_hash,
+            type_db,
+        )?;
+        let Some(mem_tyinfo) = mem_tyinfo else {
+            tymems.push(Member::new_placeholder(0, member_size, "__unknown_type", Some(tylayout)));
+            continue;
+        };
+        debug_assert!(mem_tyinfo.packed_size <= member_size);
+
+        tymems.push(Member {
+            off: 0,
+            len: mem_tyinfo.packed_size,
+            def: format!("{} {}", &mem_tyinfo.name, &member_name),
+            field_name: member_name.into_owned(),
+            comment: format!("{:?}", &tylayout),
+            is_padding: false,
+        });
+    }
+    tymems.push(Member::new_placeholder(
+        0,
+        ty_size,
+        "__HIDVA_dont_use",
+        None,
+    ));
+
+    return process_members(
+        processed,
+        printer,
+        tyidx,
+        &ty.type_name(),
+        &tymems,
+        &format!("union HidvaUnion{}", uniq_id()),
+        Some(ty_size),
+    );
+}
+
+fn process_struct_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty: &parser::StructType,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    if ty.is_declaration() {
+        let tyname = ty.type_name();
+        let Some(&real_tyidx) = type_db.get(&tyname) else {
+            warn!("process_struct_type: unknown declaration struct. typidx={:?} typname={}", tyidx, tyname);
+            return Ok(());
+        };
+        return handle_sym_link(
+            processed,
+            printer,
+            tyidx,
+            real_tyidx,
+            ty_max_size,
+            inputs_hash,
+            type_db,
+        );
     }
 
-    if let Some(values) = matches.values_of(OPT_PRINT) {
-        for value in values {
-            match value {
-                OPT_PRINT_ALL => {
-                    options.print_file_address = true;
-                    options.print_unit_address = true;
-                    options.print_source = true;
-                    options.print_function_calls = true;
-                    options.print_function_instructions = true;
-                    options.print_function_variables = true;
-                    options.print_function_stack_frame = true;
-                    options.print_inlined_function_parameters = true;
-                    options.print_variable_locations = true;
-                }
-                OPT_PRINT_ADDRESS => {
-                    options.print_file_address = true;
-                    options.print_unit_address = true;
-                }
-                OPT_PRINT_SOURCE => options.print_source = true,
-                OPT_PRINT_FILE_ADDRESS => options.print_file_address = true,
-                OPT_PRINT_UNIT_ADDRESS => options.print_unit_address = true,
-                OPT_PRINT_FUNCTION_CALLS => options.print_function_calls = true,
-                OPT_PRINT_FUNCTION_INSTRUCTIONS => options.print_function_instructions = true,
-                OPT_PRINT_FUNCTION_VARIABLES => options.print_function_variables = true,
-                OPT_PRINT_FUNCTION_STACK_FRAME => options.print_function_stack_frame = true,
-                OPT_PRINT_INLINED_FUNCTION_PARAMETERS => {
-                    options.print_inlined_function_parameters = true
-                }
-                OPT_PRINT_VARIABLE_LOCATIONS => options.print_variable_locations = true,
-                _ => cmd
-                    .error(
-                        clap::ErrorKind::InvalidValue,
-                        format!("invalid {} value: {}", OPT_PRINT, value),
-                    )
-                    .exit(),
-            }
+    let Some(mut ty_bit_size) = ty.bit_size() else {
+        warn!("process_struct_type: unknown type size: tyidx={:?} tyname={}", tyidx, ty.type_name());
+        return Ok(());
+    };
+    let ty_dwarf_size = ty.byte_size().unwrap();
+    let mut tylayout = ty.layout(&inputs_hash[tyidx.input_id]);
+    while let Some(lastlayout) = tylayout.last() {
+        if let parser::LayoutItem::Padding = lastlayout.item {
+            let s = lastlayout.bit_size.get().unwrap();
+            debug_assert!(ty_bit_size >= s);
+            ty_bit_size -= s;
+            tylayout.pop();
+        } else {
+            break;
         }
     }
-
-    if let Some(values) = matches.values_of(OPT_FILTER) {
-        for value in values {
-            if let Some(index) = value.bytes().position(|c| c == b'=') {
-                let key = &value[..index];
-                let value = &value[index + 1..];
-                match key {
-                    OPT_FILTER_INLINE | OPT_FILTER_FUNCTION_INLINE => {
-                        options.filter_function_inline = match value {
-                            "y" | "yes" => Some(true),
-                            "n" | "no" => Some(false),
-                            _ => cmd
-                                .error(
-                                    clap::ErrorKind::InvalidValue,
-                                    format!("invalid {} {} value: {}", OPT_FILTER, key, value),
-                                )
-                                .exit(),
-                        };
-                    }
-                    OPT_FILTER_NAME => options.filter_name = Some(value.into()),
-                    OPT_FILTER_NAMESPACE => {
-                        options.filter_namespace = value.split("::").map(String::from).collect()
-                    }
-                    OPT_FILTER_UNIT => options.filter_unit = Some(value.into()),
-                    _ => cmd
-                        .error(
-                            clap::ErrorKind::InvalidValue,
-                            format!("invalid {} key: {}", OPT_FILTER, key),
-                        )
-                        .exit(),
-                }
+    let tylayout = tylayout;
+    let tysize = bit2byte(ty_bit_size);
+    let ty_max_size = match ty_max_size {
+        Some(v) => {
+            if v > tysize {
+                tysize
             } else {
-                cmd.error(
-                    clap::ErrorKind::InvalidValue,
-                    format!("missing {} value for key: {}", OPT_FILTER, value),
-                )
-                .exit();
+                v
             }
         }
-    }
-
-    options.sort = match matches.value_of(OPT_SORT) {
-        Some(OPT_SORT_NAME) => ddbug::Sort::Name,
-        Some(OPT_SORT_SIZE) => ddbug::Sort::Size,
-        Some(value) => cmd
-            .error(
-                clap::ErrorKind::InvalidValue,
-                format!("invalid {} key: {}", OPT_SORT, value),
-            )
-            .exit(),
-        _ => ddbug::Sort::None,
+        None => tysize,
     };
 
-    if let Some(values) = matches.values_of(OPT_IGNORE) {
-        for value in values {
-            match value {
-                OPT_IGNORE_ADDED => options.ignore_added = true,
-                OPT_IGNORE_DELETED => options.ignore_deleted = true,
-                OPT_IGNORE_ADDRESS => {
-                    options.ignore_function_address = true;
-                    options.ignore_variable_address = true;
-                }
-                OPT_IGNORE_LINKAGE_NAME => {
-                    options.ignore_function_linkage_name = true;
-                    options.ignore_variable_linkage_name = true;
-                }
-                OPT_IGNORE_SYMBOL_NAME => {
-                    options.ignore_function_symbol_name = true;
-                    options.ignore_variable_symbol_name = true;
-                }
-                OPT_IGNORE_FUNCTION_ADDRESS => options.ignore_function_address = true,
-                OPT_IGNORE_FUNCTION_SIZE => options.ignore_function_size = true,
-                OPT_IGNORE_FUNCTION_INLINE => options.ignore_function_inline = true,
-                OPT_IGNORE_FUNCTION_SYMBOL_NAME => options.ignore_function_symbol_name = true,
-                OPT_IGNORE_VARIABLE_ADDRESS => options.ignore_variable_address = true,
-                OPT_IGNORE_VARIABLE_SYMBOL_NAME => options.ignore_variable_symbol_name = true,
-                _ => cmd
-                    .error(
-                        clap::ErrorKind::InvalidValue,
-                        format!("invalid {} value: {}", OPT_IGNORE, value),
-                    )
-                    .exit(),
+    let mut tymems = Vec::<Member>::with_capacity(tylayout.len());
+    let mut next_idx = find_next_idx(&tylayout, 0);
+    debug_assert_eq!(next_idx.unwrap_or(0), 0);
+    while let Some(item_idx) = next_idx {
+        debug_assert_eq!(tylayout[item_idx].bit_offset % BITS_PER_BYTE, 0);
+        debug_assert!(item_idx != 0 || tylayout[item_idx].bit_offset == 0); // layout() 函数会确保从 offset: 0 开始.
+        next_idx = find_next_idx(&tylayout, item_idx + 1);
+
+        let member_off = tylayout[item_idx].bit_offset / BITS_PER_BYTE;
+        // member_size item_idx 占用的空间, 字节为单位.
+        // 这里以 member_size 为准, 而不是 tylayout[item_idx].bit_size. 详见 S1218, A1218 例子.
+        let member_size = next_idx
+            .map(|v| tylayout[v].bit_offset / BITS_PER_BYTE)
+            .unwrap_or(ty_max_size)
+            - member_off;
+        // debug_assert!(tylayout[item_idx].bit_size.get().map(|v| v <= member_size).unwrap_or(true));
+        if member_size <= 0 && next_idx.is_some() {
+            continue;
+        }
+        // member_size == 0 && next_idx.is_none() 意味着 member 是最后一个元素, 如下示例所示:
+        //   struct S {int i; char ch[0];}
+        // 此时 ch member_size = 0.
+
+        if is_bitfield(&tylayout[item_idx]) {
+            // 更合适的做法, 是将 tymem 拆分字段以及 padding 部分,
+            //   struct S { long i: 2; };
+            //   struct A: public S {char ch;};
+            // 不过实测这里 A.ch 并不会塞到 S padding 中, 所以拆不拆都行.
+            tymems.push(Member::new_placeholder(
+                member_off,
+                member_size,
+                "_bitfield",
+                Some(&tylayout[item_idx]),
+            ));
+            continue;
+        }
+
+        let (member_tyoff, member_name) = match tylayout[item_idx].item {
+            parser::LayoutItem::Padding => {
+                tymems.push(Member::new_padding(member_off, member_size));
+                continue;
             }
+            parser::LayoutItem::Member(mem) => (mem.type_offset(), member_name(mem.name())),
+            parser::LayoutItem::Inherit(mem) => (
+                mem.type_offset(),
+                Cow::Owned(format!("__parent{}", uniq_id())),
+            ),
+            parser::LayoutItem::VariantPart(_) => {
+                tymems.push(Member::new_placeholder(
+                    member_off,
+                    member_size,
+                    "__variant_part",
+                    Some(&tylayout[item_idx]),
+                ));
+                continue;
+            }
+        };
+        let mem_tyidx = TypeIndex {
+            input_id: tyidx.input_id,
+            typoff: member_tyoff,
+        };
+        let mem_tyinfo = get_type_info(
+            processed,
+            printer,
+            mem_tyidx,
+            Some(member_size),
+            inputs_hash,
+            type_db,
+        )?;
+        let Some(mem_tyinfo) = mem_tyinfo else {
+            tymems.push(Member::new_placeholder(member_off, member_size, "__unknown_type", Some(&tylayout[item_idx])));
+            continue;
+        };
+        debug_assert!(mem_tyinfo.packed_size <= member_size);
+
+        tymems.push(Member {
+            off: member_off,
+            len: mem_tyinfo.packed_size,
+            def: format!("{} {}", &mem_tyinfo.name, &member_name),
+            field_name: member_name.into_owned(),
+            comment: format!("{:?}", &tylayout[item_idx]),
+            is_padding: false,
+        });
+        if mem_tyinfo.packed_size < member_size {
+            tymems.push(Member::new_padding(
+                member_off + mem_tyinfo.packed_size,
+                member_size - mem_tyinfo.packed_size,
+            ));
+        }
+    }
+    while let Some(member) = tymems.last() {
+        if member.is_padding {
+            tymems.pop();
+        } else {
+            break;
         }
     }
 
-    if let Some(values) = matches.values_of(OPT_PREFIX_MAP) {
-        for value in values {
-            if let Some(index) = value.bytes().position(|c| c == b'=') {
-                let old = &value[..index];
-                let new = &value[index + 1..];
-                options.prefix_map.push((old.into(), new.into()));
-            } else {
-                cmd.error(
-                    clap::ErrorKind::InvalidValue,
-                    format!("invalid {} value: {}", OPT_PREFIX_MAP, value),
-                )
-                .exit();
-            }
+    return process_members(
+        processed,
+        printer,
+        tyidx,
+        &ty.type_name(),
+        &tymems,
+        &format!("struct HidvaStruct{}", uniq_id()),
+        Some(ty_dwarf_size),
+    );
+}
+
+fn process_enum_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty: &parser::EnumerationType,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    if ty.is_declaration() {
+        let tyname = ty.type_name();
+        let Some(&real_tyidx) = type_db.get(&tyname) else {
+            warn!("process_enum_type: unknown declaration. typidx={:?} typname={}", tyidx, tyname);
+            return Ok(());
+        };
+        return handle_sym_link(
+            processed,
+            printer,
+            tyidx,
+            real_tyidx,
+            ty_max_size,
+            inputs_hash,
+            type_db,
+        );
+    }
+    let Some(ty_size) = ty.byte_size(&inputs_hash[tyidx.input_id]) else {
+        warn!("process_enum_type: unknown byte size. typidx={:?} typname={}", tyidx, ty.type_name());
+        return Ok(());
+    };
+    if let Some(ty_max_size) = ty_max_size {
+        if ty_size > ty_max_size {
+            warn!(
+                "process_enum_type: invalid byte size. typidx={:?} typname={} expect={} actual={}",
+                tyidx,
+                ty.type_name(),
+                ty_max_size,
+                ty_size
+            );
+            return Ok(());
         }
-        options.prefix_map.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     }
 
-    if let Some(mut paths) = matches.values_of(OPT_DIFF) {
-        let path_a = paths.next().unwrap();
-        let path_b = paths.next().unwrap();
+    // EnumerationType::ty may be none, 所以我们自己选择类型吧.
+    let ty_repr = if ty_size == 8 {
+        "__s64"
+    } else if ty_size == 4 {
+        "__s32"
+    } else if ty_size == 2 {
+        "__s16"
+    } else if ty_size == 1 {
+        "__s8"
+    } else {
+        warn!(
+            "process_enum_type: invalid byte size. typidx={:?} typname={} expect=8/4/2/1 actual={}",
+            tyidx,
+            ty.type_name(),
+            ty_size
+        );
+        return Ok(());
+    };
 
-        match ddbug::File::parse(path_a.to_string()) {
-            Err(e) => error!("{}: {}", path_a, e),
-            Ok(file_a) => match ddbug::File::parse(path_b.to_string()) {
-                Err(e) => error!("{}: {}", path_b, e),
-                Ok(file_b) => {
-                    if let Err(e) = {
-                        let index = ddbug::diff_index(file_a.file(), file_b.file(), &options);
-                        if options.http {
-                            let state = ServeDiffState {
-                                file_a,
-                                file_b,
-                                options,
-                                index,
-                            };
-                            serve(state, serve_diff_file)
-                        } else {
-                            diff_file(file_a.file(), file_b.file(), &options)
-                        }
-                    } {
-                        error!("{}", e);
-                    }
-                }
+    let mut asserts = Vec::<EqAssert>::new();
+    let mut struct_def = Vec::<String>::new();
+    asserts.push(EqAssert {
+        expr: format!("sizeof({})", ty_repr),
+        val: ty_size,
+    });
+    let tydef = format!("HidvaEnum{}", uniq_id());
+    struct_def.push(format!("// --- enum {} begin ---", &tydef));
+    for enum_item in &ty.enumerators(&inputs_hash[tyidx.input_id]) {
+        struct_def.push(format!(
+            "// {}={}",
+            enum_item.name().unwrap_or("<unknown enum item>"),
+            enum_item.value().unwrap_or(-20181218),
+        ));
+    }
+    struct_def.push(format!("// --- enum {} end ---", &tydef));
+    struct_def.push(format!("typedef {} {};", ty_repr, &tydef));
+
+    processed.insert(
+        tyidx,
+        Some(Rc::new(TypeInfo {
+            name: tydef,
+            packed_size: ty_size,
+            size: ty_size,
+        })),
+    );
+    printer.add_type(&struct_def)?;
+    printer.add_eq_asserts(&asserts)?;
+    return Ok(());
+}
+
+fn process_array_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty: &parser::ArrayType,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    let mem_tyidx = TypeIndex {
+        input_id: tyidx.input_id,
+        typoff: ty.ty,
+    };
+    let mem_tyinfo = get_type_info(processed, printer, mem_tyidx, None, inputs_hash, type_db)?;
+    let Some(mem_tyinfo) = mem_tyinfo else {
+        warn!("process_array_type: unknown element type: tyidx={:?} ty={:?}", tyidx, ty);
+        return Ok(());
+    };
+
+    let mut mem_tyname = mem_tyinfo.name.clone();
+    if mem_tyinfo.size > mem_tyinfo.packed_size {
+        // 以 S1218 为例, 我们在生成 S1218 是 packed 的, 但如果 S1218 作为 array element, 则
+        // 需要保持其原有 padding.
+        mem_tyname = format!("struct HidvaArrayStruct{}", uniq_id());
+        let mut members = Vec::<Member>::new();
+        let data_name = "data";
+        members.push(Member {
+            off: 0,
+            len: mem_tyinfo.packed_size,
+            field_name: data_name.to_string(),
+            def: format!("{} {}", mem_tyinfo.name, data_name),
+            comment: String::new(),
+            is_padding: false,
+        });
+        members.push(Member::new_padding(
+            mem_tyinfo.packed_size,
+            mem_tyinfo.size - mem_tyinfo.packed_size,
+        ));
+        process_members(
+            processed,
+            printer,
+            tyidx,
+            &parser::TypeName {
+                namespace: None,
+                name: Some("padding struct for array"),
             },
-        }
-    } else if let Some(path) = matches.value_of(OPT_BLOAT) {
-        if let Err(e) = ddbug::File::parse(path.to_string()).and_then(|file| {
-            let index = ddbug::bloat_index(file.file(), &options);
-            if options.http {
-                let state = ServeBloatState {
-                    file,
-                    options,
-                    index,
-                };
-                serve(state, serve_bloat_file)
-            } else {
-                bloat_file(file.file(), &options, &index)
-            }
-        }) {
-            error!("{}: {}", path, e);
-        }
+            &members,
+            &mem_tyname,
+            None,
+        )?;
+    }
+
+    let array_name = format!("HidvaArray{}", uniq_id());
+    let ele_cnt = if ty_max_size == Some(0) {
+        0
     } else {
-        let path = matches.value_of(OPT_FILE).unwrap();
+        let Some(array_byte_size) = ty.byte_size(&inputs_hash[tyidx.input_id]) else {
+            warn!("process_array_type: unknown array size: tyidx={:?} ty={:?}", tyidx, ty);
+            return Ok(());
+        };
+        if let Some(max_size) = ty_max_size {
+            if max_size < array_byte_size {
+                return Ok(());
+            }
+        }
+        let Some(ele_count) = ty.count(&inputs_hash[tyidx.input_id]) else {
+            warn!("process_array_type: unknown element count: tyidx={:?} ty={:?}", tyidx, ty);
+            return Ok(());
+        };
+        if array_byte_size % ele_count != 0 || mem_tyinfo.size != array_byte_size / ele_count {
+            warn!(
+                "process_array_type: invalid array def: tyidx={:?} ty={:?}",
+                tyidx, ty
+            );
+            return Ok(());
+        }
+        ele_count
+    };
 
-        if let Err(e) = ddbug::File::parse(path.to_string()).and_then(|file| {
-            let index = ddbug::print_index(file.file(), &options);
-            if options.http {
-                let state = ServePrintState {
-                    file,
-                    options,
-                    index,
-                };
-                serve(state, serve_print_file)
+    let array_size = mem_tyinfo.size * ele_cnt;
+    printer.add_type(&[format!(
+        "typedef {} {}[{}];",
+        mem_tyname, array_name, ele_cnt
+    )])?;
+    printer.add_eq_assert(&format!("sizeof({})", array_name), array_size)?;
+    processed.insert(
+        tyidx,
+        Some(Rc::new(TypeInfo {
+            name: array_name.clone(),
+            packed_size: array_size,
+            size: array_size,
+        })),
+    );
+    return Ok(());
+}
+
+fn process_modifier_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty: &parser::TypeModifier,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    let real_tyidx = TypeIndex {
+        input_id: tyidx.input_id,
+        typoff: ty.ty,
+    };
+    match ty.kind() {
+        parser::TypeModifierKind::Const
+        | parser::TypeModifierKind::Packed
+        | parser::TypeModifierKind::Volatile
+        | parser::TypeModifierKind::Restrict
+        | parser::TypeModifierKind::Shared
+        | parser::TypeModifierKind::Atomic
+        | parser::TypeModifierKind::Other => {
+            return handle_sym_link(
+                processed,
+                printer,
+                tyidx,
+                real_tyidx,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+        parser::TypeModifierKind::Pointer
+        | parser::TypeModifierKind::Reference
+        | parser::TypeModifierKind::RvalueReference => {
+            let Some(tysize) = ty.byte_size(&inputs_hash[tyidx.input_id]) else {
+                warn!("process_modifier_type: unknown byte size: tyidx={:?}", tyidx);
+                return Ok(());
+            };
+            if let Some(maxsize) = ty_max_size {
+                if maxsize < tysize {
+                    warn!(
+                        "process_modifier_type: invalid byte size: tyidx={:?} maxsize={} size={}",
+                        tyidx, maxsize, tysize
+                    );
+                    return Ok(());
+                }
+            }
+
+            let real_tyinfo = get_type_info(
+                processed,
+                printer,
+                real_tyidx,
+                None,
+                inputs_hash,
+                type_db,
+            )?;
+            let real_tyname = if let Some(tyinfo) = &real_tyinfo {
+                &tyinfo.name
             } else {
-                print_file(file.file(), &options)
+                "void"
+            };
+            let tyname = format!("{}*", real_tyname);
+
+            printer.add_eq_assert(&format!("sizeof({})", tyname), tysize)?;
+            processed.insert(
+                tyidx,
+                Some(Rc::new(TypeInfo {
+                    name: tyname,
+                    packed_size: tysize,
+                    size: tysize,
+                })),
+            );
+        }
+    }
+    return Ok(());
+}
+
+// process_type 之后, ty 一定存在于 processed 之中,
+// processed[ty] 为 None, 意味着没有有效信息.
+// 由于 typedef 的存在, 可能会出现多个 tyidx 对应着相同的 TypeInfo, 所以使用 Rc.
+//
+// 该函数调用时, ty 一定不在 processed 中.
+fn process_type(
+    processed: &mut ProcessState,
+    printer: &mut Printer,
+    tyidx: TypeIndex,
+    ty_max_size: Option<u64>,
+    inputs_hash: &[parser::FileHash],
+    type_db: &HashMap<parser::TypeName, TypeIndex>,
+) -> io::Result<()> {
+    debug_assert!(!processed.contains_key(&tyidx));
+    processed.insert(tyidx, None); // 先占个坑,
+
+    let typ = parser::Type::from_offset(&inputs_hash[tyidx.input_id], tyidx.typoff);
+    let Some(typ) = typ else {
+        warn!("process_type: unknown type. tyidx={:?}", tyidx);
+        return Ok(());
+    };
+    let typ = typ.as_ref();
+
+    match typ.kind() {
+        parser::TypeKind::Void
+        | parser::TypeKind::Function(_)
+        | parser::TypeKind::PointerToMember(_)
+        | parser::TypeKind::Subrange(_)
+        | parser::TypeKind::Unspecified(_) => {}
+        parser::TypeKind::Base(ty) => {
+            let (Some(tyname), Some(tysize)) = (ty.name(), ty.byte_size()) else {
+                warn!("process_type: base type has no name. tyidx={:?}", tyidx);
+                return Ok(());
+            };
+            processed.insert(
+                tyidx,
+                Some(Rc::new(TypeInfo {
+                    name: tyname.to_string(),
+                    packed_size: tysize,
+                    size: tysize,
+                })),
+            );
+            printer.add_eq_assert(&format!("sizeof({})", tyname), tysize)?;
+        }
+        parser::TypeKind::Def(ty) => {
+            let real_typidx = TypeIndex {
+                input_id: tyidx.input_id,
+                typoff: ty.ty,
+            };
+            handle_sym_link(
+                processed,
+                printer,
+                tyidx,
+                real_typidx,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            )?;
+        }
+        parser::TypeKind::Struct(ty) => {
+            return process_struct_type(
+                processed,
+                printer,
+                tyidx,
+                ty,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+        parser::TypeKind::Union(ty) => {
+            return process_union_type(
+                processed,
+                printer,
+                tyidx,
+                ty,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+        parser::TypeKind::Enumeration(ty) => {
+            return process_enum_type(
+                processed,
+                printer,
+                tyidx,
+                ty,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+        parser::TypeKind::Array(ty) => {
+            return process_array_type(
+                processed,
+                printer,
+                tyidx,
+                ty,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+        parser::TypeKind::Modifier(ty) => {
+            return process_modifier_type(
+                processed,
+                printer,
+                tyidx,
+                ty,
+                ty_max_size,
+                inputs_hash,
+                type_db,
+            );
+        }
+    }
+    return Ok(());
+}
+
+fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let args = Args::parse();
+
+    let mut inputs = Vec::new();
+    let mut inputs_hash = Vec::new();
+    for input_path in &args.so_path {
+        info!("load so. path={}", input_path);
+        inputs.push(parser::File::parse(input_path.clone())?);
+    }
+    for input_path in &args.so_file_path {
+        for line in read_lines(input_path)? {
+            let line = line?;
+            info!("load so. path={}", &line);
+            inputs.push(parser::File::parse(line)?);
+        }
+    }
+    info!("build input file hash");
+    for input in &inputs {
+        inputs_hash.push(parser::FileHash::new(input.file()));
+    }
+
+    info!("build type db");
+    let mut dest = Vec::new();
+    let mut type_db = HashMap::new();
+    for (input_id, hash) in inputs_hash.iter().enumerate() {
+        for (&typoff, &typ) in hash.types.iter() {
+            if is_declaration(typ) {
+                continue;
             }
-        }) {
-            error!("{}: {}", path, e);
-        }
-    }
-}
-
-fn diff_file(
-    file_a: &ddbug::File,
-    file_b: &ddbug::File,
-    options: &ddbug::Options,
-) -> ddbug::Result<()> {
-    format(options, |printer| {
-        if let Err(e) = ddbug::diff(printer, file_a, file_b, options) {
-            error!("{}", e);
-        }
-        Ok(())
-    })
-}
-
-fn bloat_file(
-    file: &ddbug::File,
-    options: &ddbug::Options,
-    index: &ddbug::BloatIndex,
-) -> ddbug::Result<()> {
-    format(options, |printer| {
-        ddbug::bloat(file, printer, options, index)
-    })
-}
-
-fn print_file(file: &ddbug::File, options: &ddbug::Options) -> ddbug::Result<()> {
-    format(options, |printer| ddbug::print(file, printer, options))
-}
-
-fn format<F>(options: &ddbug::Options, f: F) -> ddbug::Result<()>
-where
-    F: FnOnce(&mut dyn ddbug::Printer) -> ddbug::Result<()>,
-{
-    let stdout = std::io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    if options.html {
-        let mut printer = ddbug::HtmlPrinter::new(&mut writer, options);
-        printer.begin()?;
-        f(&mut printer)?;
-        printer.end()
-    } else {
-        let mut printer = ddbug::TextPrinter::new(&mut writer, options);
-        f(&mut printer)
-    }
-}
-
-struct ServeDiffState {
-    file_a: parser::FileContext,
-    file_b: parser::FileContext,
-    options: ddbug::Options,
-    index: ddbug::DiffIndex,
-}
-
-fn serve_diff_file(writer: &mut Vec<u8>, mut path: str::Split<char>, state: &ServeDiffState) {
-    match path.next() {
-        Some("") => {
-            let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-            printer.begin().unwrap();
-            ddbug::diff(
-                &mut printer,
-                state.file_a.file(),
-                state.file_b.file(),
-                &state.options,
-            )
-            .unwrap();
-            printer.end().unwrap();
-        }
-        Some("id") => {
-            let id = path.next().and_then(|id| str::parse::<usize>(id).ok());
-            if let Some(id) = id {
-                match path.next() {
-                    None => {
-                        let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-                        ddbug::diff_id(
-                            id,
-                            state.file_a.file(),
-                            state.file_b.file(),
-                            &mut printer,
-                            &state.options,
-                            &state.index,
-                        );
-                    }
-                    _ => {}
+            if let Some(typname) = parser::TypeName::try_from(typ) {
+                let typidx = TypeIndex { input_id, typoff };
+                if args.is_dest(&typname) {
+                    dest.push(typidx);
                 }
-            }
-        }
-        _ => {}
-    }
-}
-
-struct ServePrintState {
-    file: parser::FileContext,
-    options: ddbug::Options,
-    index: ddbug::PrintIndex,
-}
-
-fn serve_print_file(writer: &mut Vec<u8>, mut path: str::Split<char>, state: &ServePrintState) {
-    match path.next() {
-        Some("") => {
-            let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-            printer.begin().unwrap();
-            ddbug::print(state.file.file(), &mut printer, &state.options).unwrap();
-            printer.end().unwrap();
-        }
-        Some("id") => {
-            let id = path.next().and_then(|id| str::parse::<usize>(id).ok());
-            if let Some(id) = id {
-                match path.next() {
-                    None => {
-                        let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-                        ddbug::print_id(
-                            id,
-                            None,
-                            state.file.file(),
-                            &mut printer,
-                            &state.options,
-                            &state.index,
-                        );
-                    }
-                    Some("parent") => {
-                        if let Some(parent_id) =
-                            ddbug::print_parent(id, state.file.file(), &state.index)
-                        {
-                            write!(writer, "{}", parent_id).unwrap();
-                        }
-                    }
-                    Some(detail) => {
-                        let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-                        ddbug::print_id(
-                            id,
-                            Some(detail),
-                            state.file.file(),
-                            &mut printer,
-                            &state.options,
-                            &state.index,
-                        );
-                    }
+                // type_db 存放着哪些可能会被跨 so file 引用的符号, 很显然 anon ty
+                // 不在这种.
+                if typ.is_anon() {
+                    continue;
                 }
+                type_db.insert(typname, typidx);
             }
         }
-        _ => {}
     }
-}
 
-struct ServeBloatState {
-    file: parser::FileContext,
-    options: ddbug::Options,
-    index: ddbug::BloatIndex,
-}
-
-fn serve_bloat_file(writer: &mut Vec<u8>, mut path: str::Split<char>, state: &ServeBloatState) {
-    match path.next() {
-        Some("") => {
-            let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-            printer.begin().unwrap();
-            ddbug::bloat(
-                state.file.file(),
-                &mut printer,
-                &state.options,
-                &state.index,
-            )
-            .unwrap();
-            printer.end().unwrap();
-        }
-        Some("id") => {
-            let id = path.next().and_then(|id| str::parse::<usize>(id).ok());
-            if let Some(id) = id {
-                let mut printer = ddbug::HtmlPrinter::new(writer, &state.options);
-                ddbug::bloat_id(
-                    id,
-                    state.file.file(),
-                    &mut printer,
-                    &state.options,
-                    &state.index,
-                );
-            }
-        }
-        _ => {}
+    let mut printer = Printer::try_open(&args.out_path)?;
+    let mut processed = ProcessState::new();
+    for dest_ty in &dest {
+        process_type(
+            &mut processed,
+            &mut printer,
+            *dest_ty,
+            None,
+            &inputs_hash,
+            &type_db,
+        )?;
     }
-}
-
-fn serve<T: Send + Sync + 'static>(
-    state: T,
-    f: fn(&mut Vec<u8>, str::Split<char>, &T),
-) -> ddbug::Result<()> {
-    let state = Arc::new(state);
-    let make_service = make_service_fn(move |_socket: &AddrStream| {
-        let state = state.clone();
-        async move {
-            Ok::<_, Infallible>(service_fn(move |request: Request<_>| {
-                let state = state.clone();
-                async move {
-                    let mut writer = Vec::new();
-                    let mut path = request.uri().path();
-                    if path == "" {
-                        path = "/";
-                    }
-                    if path.starts_with("/") {
-                        let mut path = path.split('/');
-                        path.next();
-                        f(&mut writer, path, &state);
-                    }
-                    Ok::<_, Infallible>(Response::new(Body::from(writer)))
-                }
-            }))
-        }
-    });
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .unwrap();
-    rt.block_on(async move {
-        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-        let mut incoming = AddrIncoming::bind(&addr).unwrap();
-        incoming.set_nodelay(true);
-        let local_addr = incoming.local_addr();
-        let server = Server::builder(incoming).serve(make_service);
-        println!("Listening on http://{}", local_addr);
-        // TODO: support other OS
-        #[cfg(target_os = "linux")]
-        std::process::Command::new("xdg-open")
-            .arg(format!("http://{}", local_addr))
-            .status()
-            .unwrap();
-        server.await.unwrap();
-    });
-
-    Ok(())
+    printer.finish()?;
+    return Ok(());
 }

@@ -1,27 +1,17 @@
 [package]
-name = "ddbug"
-version = "0.3.0"
-description = "Display debugging information"
-repository = "https://github.com/gimli-rs/ddbug"
+name = "clayout"
+version = "0.3.3"
+description = "Translate C++/Rust type into C type with the same memory layout."
+repository = "https://github.com/hidva/clayout"
 readme = "../README.md"
 keywords = ["debug", "DWARF"]
 categories = ["development-tools::debugging"]
 license = "Apache-2.0 OR MIT"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-capstone = "0.10"
-capstone-sys = "0.14"
-clap = { version = "3.1", features = ["cargo"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 env_logger = "0.9"
-fnv = "1.0"
 log = "0.4"
-marksman_escape = "0.1"
-memmap = "0.7"
 parser = { package = "ddbug_parser", version = "0.3.0", path = "../parser" }
-hyper = { version = "0.14", features = ["server", "tcp", "http1", "http2"] }
-tokio = "1.0"
-
-[features]
-system_alloc = []
-default = []

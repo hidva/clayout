@@ -17,7 +17,6 @@
 //! Ok(())
 //! }
 //! ```
-#![deny(missing_docs)]
 // Enable some rust 2018 idioms.
 #![warn(bare_trait_objects)]
 #![warn(unused_extern_crates)]

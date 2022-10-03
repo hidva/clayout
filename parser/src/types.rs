@@ -10,6 +10,121 @@ use crate::namespace::Namespace;
 use crate::source::Source;
 use crate::{Id, Size};
 
+pub struct TypeName<'a, 'input> {
+    pub namespace: Option<&'a Namespace<'input>>,
+    pub name: Option<&'input str>,
+}
+
+impl std::fmt::Display for TypeName<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut vec = Vec::new();
+        vec.push(self.name.unwrap_or("<anon>"));
+        let mut ns_opt = self.namespace;
+        while let Some(ns) = ns_opt {
+            // namespace kind 我也想输出一下...
+            vec.push(ns.name.unwrap_or("<anon>"));
+            ns_opt = ns.parent();
+        }
+        // C++/Rust namespace 都规定了 root namespace 为空, 即 std::vector 全称是 ::std::vector.
+        for item in vec.iter().rev() {
+            write!(f, "::{}", item)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a, 'input> TypeName<'a, 'input> {
+    pub fn try_from(ty: &'a Type<'input>) -> Option<TypeName<'a, 'input>> {
+        match ty.kind() {
+            TypeKind::Base(b) => Some(TypeName {
+                namespace: None,
+                name: b.name,
+            }),
+            TypeKind::Def(b) => Some(TypeName {
+                namespace: b.namespace(),
+                name: b.name,
+            }),
+            TypeKind::Struct(b) => Some(b.type_name()),
+            TypeKind::Union(b) => Some(b.type_name()),
+            TypeKind::Enumeration(b) => Some(b.type_name()),
+            // Unspecified 啥意思?
+            // TypeKind::Unspecified(b) => Some(TypeName {
+            //     namespace: b.namespace(),
+            //     name: b.name,
+            // }),
+            _ => None,
+        }
+    }
+
+    pub fn ends_with(&self, val: &[String]) -> bool {
+        let mut val_iter = val.iter().rev();
+        match (self.name, val_iter.next()) {
+            // val 为空, 此时返回 true 吧.
+            (Some(_), None) => return true,
+            (None, None) => return true, // 这时候也返回 true???
+            (None, Some(_)) => return false,
+            (Some(selfval), Some(val)) => {
+                if selfval != val.as_str() {
+                    return false;
+                }
+            }
+        }
+        let mut parent = self.namespace;
+        loop {
+            match (parent, val_iter.next()) {
+                (Some(_), None) => return true,
+                (None, None) => return true,
+                (None, Some(_)) => return false,
+                (Some(selfparent), Some(val)) => {
+                    if selfparent.name != Some(val.as_str()) {
+                        return false;
+                    }
+                    parent = selfparent.parent();
+                }
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for TypeName<'_, '_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+
+        let mut self_ns_opt = self.namespace;
+        while let Some(self_ns) = self_ns_opt {
+            self_ns.name().hash(state);
+            self_ns.kind().hash(state);
+            self_ns_opt = self_ns.parent();
+        }
+        return;
+    }
+}
+
+impl std::cmp::PartialEq for TypeName<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+        let mut self_ns_opt = self.namespace;
+        let mut other_ns_opt = other.namespace;
+        loop {
+            match (self_ns_opt, other_ns_opt) {
+                (Some(_), None) | (None, Some(_)) => return false,
+                (None, None) => return true,
+                (Some(self_ns), Some(other_ns)) => {
+                    if self_ns.kind() != other_ns.kind() || self_ns.name() != other_ns.name() {
+                        return false;
+                    }
+                    self_ns_opt = self_ns.parent();
+                    other_ns_opt = other_ns.parent();
+                }
+            }
+        }
+    }
+}
+
+impl std::cmp::Eq for TypeName<'_, '_> {}
+
 /// The kind of a type.
 #[derive(Debug, Clone)]
 pub enum TypeKind<'input> {
@@ -301,7 +416,7 @@ impl<'input> Type<'input> {
 #[derive(Debug, Clone)]
 pub struct TypeModifier<'input> {
     pub(crate) kind: TypeModifierKind,
-    pub(crate) ty: TypeOffset,
+    pub ty: TypeOffset,
     pub(crate) name: Option<&'input str>,
     pub(crate) byte_size: Size,
     // TODO: hack
@@ -530,13 +645,13 @@ impl<'input> BaseType<'input> {
 pub struct TypeDef<'input> {
     pub(crate) namespace: Option<Arc<Namespace<'input>>>,
     pub(crate) name: Option<&'input str>,
-    pub(crate) ty: TypeOffset,
+    pub ty: TypeOffset,
     pub(crate) source: Source<'input>,
 }
 
 impl<'input> TypeDef<'input> {
     /// The namespace of the type.
-    pub fn namespace(&self) -> Option<&Namespace> {
+    pub fn namespace(&self) -> Option<&Namespace<'input>> {
         self.namespace.as_ref().map(|x| &**x)
     }
 
@@ -590,7 +705,7 @@ pub struct StructType<'input> {
 
 impl<'input> StructType<'input> {
     /// The namespace of the type.
-    pub fn namespace(&self) -> Option<&Namespace> {
+    pub fn namespace<'a>(&'a self) -> Option<&'a Namespace<'input>> {
         self.namespace.as_ref().map(|x| &**x)
     }
 
@@ -598,6 +713,13 @@ impl<'input> StructType<'input> {
     #[inline]
     pub fn name(&self) -> Option<&str> {
         self.name
+    }
+
+    pub fn type_name<'a>(&'a self) -> TypeName<'a, 'input> {
+        TypeName {
+            namespace: self.namespace(),
+            name: self.name,
+        }
     }
 
     /// The source information for the type.
@@ -682,8 +804,15 @@ pub struct UnionType<'input> {
 }
 
 impl<'input> UnionType<'input> {
+    pub fn type_name<'a>(&'a self) -> TypeName<'a, 'input> {
+        TypeName {
+            namespace: self.namespace(),
+            name: self.name,
+        }
+    }
+
     /// The namespace of the type.
-    pub fn namespace(&self) -> Option<&Namespace> {
+    pub fn namespace<'a>(&'a self) -> Option<&'a Namespace<'input>> {
         self.namespace.as_ref().map(|x| &**x)
     }
 
@@ -1113,8 +1242,15 @@ pub struct EnumerationType<'input> {
 }
 
 impl<'input> EnumerationType<'input> {
+    pub fn type_name<'a>(&'a self) -> TypeName<'a, 'input> {
+        TypeName {
+            namespace: self.namespace(),
+            name: self.name,
+        }
+    }
+
     /// The namespace of the type.
-    pub fn namespace(&self) -> Option<&Namespace> {
+    pub fn namespace<'a>(&'a self) -> Option<&'a Namespace<'input>> {
         self.namespace.as_ref().map(|x| &**x)
     }
 
@@ -1191,7 +1327,7 @@ impl<'input> Enumerator<'input> {
 /// A type for an array of elements.
 #[derive(Debug, Default, Clone)]
 pub struct ArrayType<'input> {
-    pub(crate) ty: TypeOffset,
+    pub ty: TypeOffset,
     pub(crate) count: Size,
     pub(crate) byte_size: Size,
     pub(crate) phantom: marker::PhantomData<&'input str>,
@@ -1453,7 +1589,7 @@ pub struct UnspecifiedType<'input> {
 
 impl<'input> UnspecifiedType<'input> {
     /// The namespace of the type.
-    pub fn namespace(&self) -> Option<&Namespace> {
+    pub fn namespace(&self) -> Option<&Namespace<'input>> {
         self.namespace.as_ref().map(|x| &**x)
     }
 
