@@ -33,6 +33,33 @@ impl std::fmt::Display for TypeName<'_, '_> {
     }
 }
 
+fn next_non_whitespace(iter:&mut impl Iterator<Item=char>) -> Option<char> {
+    loop {
+        let Some(ch) = iter.next() else {
+            return None;
+        };
+        if !ch.is_whitespace() {
+            return Some(ch);
+        }
+    }
+}
+
+fn starts_with_ignore_whitespace(l: &str, r: &str) -> bool {
+    let mut l_iter = l.chars();
+    let mut r_iter = r.chars();
+    loop {
+        let Some(r_ch) = next_non_whitespace(&mut r_iter) else {
+            return true;
+        };
+        let Some(l_ch) = next_non_whitespace(&mut l_iter) else {
+            return false;
+        };
+        if l_ch != r_ch {
+            return false;
+        }
+    }
+}
+
 impl<'a, 'input> TypeName<'a, 'input> {
     pub fn try_from(ty: &'a Type<'input>) -> Option<TypeName<'a, 'input>> {
         match ty.kind() {
@@ -64,7 +91,7 @@ impl<'a, 'input> TypeName<'a, 'input> {
             (None, None) => return true, // 这时候也返回 true???
             (None, Some(_)) => return false,
             (Some(selfval), Some(val)) => {
-                if selfval != val.as_str() {
+                if !starts_with_ignore_whitespace(selfval, val) {
                     return false;
                 }
             }

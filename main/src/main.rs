@@ -1,5 +1,6 @@
 use clap::Parser;
 use log::{info, warn};
+use anyhow::ensure;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -16,9 +17,50 @@ fn uniq_id() -> u64 {
     ID_GENERATOR.fetch_add(1, Relaxed)
 }
 
-// ns1::ns2::ns3::Typ => [ns1, ns2, ns3, Typ]
+fn is_ident_char(ch: char) -> bool {
+    return ch == '_' || ch.is_alphanumeric();
+}
+
+fn consume_ident_chars(out: &mut String, input: &mut impl Iterator<Item = char>) -> Option<char> {
+    while let Some(ch) = input.next() {
+        if is_ident_char(ch) {
+            out.push(ch);
+        } else {
+            return Some(ch);
+        }
+    }
+    return None;
+}
+
+// '::std::_Rb_tree_key_compare<std::less<niagara::TabletEventListener *> >' -> ['std', '_Rb_tree_key_compare<std::less<niagara::TabletEventListener *> >'].
 fn parse_typename(input: &str) -> anyhow::Result<Vec<String>> {
-    Ok(input.split("::").map(|v| v.to_string()).collect())
+    let mut ret = Vec::<String>::new();
+    let mut add_part = |p: String| {
+        if !p.is_empty() {
+            ret.push(p);
+        }
+    };
+    let mut iter = input.chars();
+    loop {
+        let mut part = String::new();
+        let next_ch = consume_ident_chars(&mut part, &mut iter);
+        let Some(next_ch) = next_ch else {
+            add_part(part);
+            return Ok(ret);
+        };
+        if next_ch == ':' {
+            add_part(part);
+            let next_ch = iter.next();
+            ensure!(next_ch == Some(':'), "invalid input symbol");
+            continue;
+        }
+        part.push(next_ch);
+        while let Some(ch) = iter.next() {
+            part.push(ch);
+        }
+        add_part(part);
+        return Ok(ret);
+    }
 }
 
 #[derive(Parser)]
@@ -331,12 +373,7 @@ fn is_bitfield(l: &parser::Layout) -> bool {
 }
 
 fn is_valid_ident(input: &str) -> bool {
-    let ret = input.trim_end_matches([
-        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-        's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
-        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '0', '1',
-        '2', '3', '4', '5', '6', '7', '8', '9', '_',
-    ]);
+    let ret = input.trim_end_matches(is_ident_char);
     return ret.is_empty();
 }
 
