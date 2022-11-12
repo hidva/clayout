@@ -222,7 +222,7 @@ impl Printer {
     fn alloc_ident(&mut self, tyname: &parser::TypeName) -> String {
         // return val may be empty
         fn get_ident_part(name: Option<&str>) -> &str {
-            name.map(|v|ident_part(v)).unwrap_or("")
+            name.map(|v| ident_part(v)).unwrap_or("")
         }
         let mut idents = 'get_idents: {
             let mut idents = Vec::new();
@@ -285,17 +285,12 @@ struct Member {
     field_name: String,
     // 没有包含结尾分号.
     def: String,
-    // comment 可能包含多行, 在最终输出, 确保每行都以 '//' 开头.
-    comment: String,
     is_padding: bool, // 仅有 new_padding() 可以设置为 true.
 }
 
 impl Member {
     // 输出到 def 时会 2 个空格缩进.
     fn print(&self, tyname: &str, def: &mut Vec<String>, asserts: &mut Vec<EqAssert>) {
-        for comment_line in self.comment.lines() {
-            def.push(format!("  // {}", comment_line));
-        }
         def.push(format!("  {};", &self.def));
 
         asserts.push(EqAssert {
@@ -315,21 +310,17 @@ impl Member {
             len,
             def: format!("__u8 {}[{}]", &field_name, len),
             field_name,
-            comment: String::new(),
             is_padding: true,
         }
     }
 
-    fn new_placeholder(off: u64, len: u64, name: &str, tylayout: Option<&parser::Layout>) -> Self {
+    fn new_placeholder(off: u64, len: u64, name: &str) -> Self {
         let field_name = format!("{}{}", name, uniq_id());
         Self {
             off,
             len,
             def: format!("__u8 {}[{}]", &field_name, len),
             field_name,
-            comment: tylayout
-                .map(|v| format!("{:?}", v))
-                .unwrap_or(String::new()),
             is_padding: false,
         }
     }
@@ -468,7 +459,7 @@ fn process_members(
     let mut asserts = Vec::<EqAssert>::new();
     let mut struct_def = Vec::<String>::new();
 
-    struct_def.push(format!("// tyidx={:?} tyname={}", tyidx, tyname));
+    struct_def.push(format!("// tyname={} tyidx={:?}", tyname, tyidx));
     struct_def.push(format!("{} {{", tydef));
     for tymem in tymems {
         tymem.print(tydef, &mut struct_def, &mut asserts);
@@ -565,12 +556,7 @@ fn process_union_type(
         };
 
         if is_bitfield(tylayout) {
-            tymems.push(Member::new_placeholder(
-                0,
-                member_size,
-                "__bitfield",
-                Some(tylayout),
-            ));
+            tymems.push(Member::new_placeholder(0, member_size, "__bitfield"));
             continue;
         }
 
@@ -589,7 +575,7 @@ fn process_union_type(
             type_db,
         )?;
         let Some(mem_tyinfo) = mem_tyinfo else {
-            tymems.push(Member::new_placeholder(0, member_size, "__unknown_type", Some(tylayout)));
+            tymems.push(Member::new_placeholder(0, member_size, "__unknown_type"));
             continue;
         };
         debug_assert!(mem_tyinfo.packed_size <= member_size);
@@ -599,16 +585,10 @@ fn process_union_type(
             len: mem_tyinfo.packed_size,
             def: format!("{} {}", &mem_tyinfo.name, &member_name),
             field_name: member_name.into_owned(),
-            comment: format!("{:?}", &tylayout),
             is_padding: false,
         });
     }
-    tymems.push(Member::new_placeholder(
-        0,
-        ty_size,
-        "__HIDVA_dont_use",
-        None,
-    ));
+    tymems.push(Member::new_placeholder(0, ty_size, "__HIDVA_dont_use"));
 
     let tydef = format!("union {}", printer.alloc_ident(&tyname));
     return process_members(
@@ -709,7 +689,6 @@ fn process_struct_type(
                 member_off,
                 member_size,
                 "_bitfield",
-                Some(&tylayout[item_idx]),
             ));
             continue;
         }
@@ -729,7 +708,6 @@ fn process_struct_type(
                     member_off,
                     member_size,
                     "__variant_part",
-                    Some(&tylayout[item_idx]),
                 ));
                 continue;
             }
@@ -747,7 +725,7 @@ fn process_struct_type(
             type_db,
         )?;
         let Some(mem_tyinfo) = mem_tyinfo else {
-            tymems.push(Member::new_placeholder(member_off, member_size, "__unknown_type", Some(&tylayout[item_idx])));
+            tymems.push(Member::new_placeholder(member_off, member_size, "__unknown_type"));
             continue;
         };
         debug_assert!(mem_tyinfo.packed_size <= member_size);
@@ -757,7 +735,6 @@ fn process_struct_type(
             len: mem_tyinfo.packed_size,
             def: format!("{} {}", &mem_tyinfo.name, &member_name),
             field_name: member_name.into_owned(),
-            comment: format!("{:?}", &tylayout[item_idx]),
             is_padding: false,
         });
         if mem_tyinfo.packed_size < member_size {
@@ -918,7 +895,6 @@ fn process_array_type(
             len: mem_tyinfo.packed_size,
             field_name: data_name.to_string(),
             def: format!("{} {}", mem_tyinfo.name, data_name),
-            comment: String::new(),
             is_padding: false,
         });
         members.push(Member::new_padding(
