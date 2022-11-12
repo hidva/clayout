@@ -10,6 +10,9 @@ use crate::namespace::Namespace;
 use crate::source::Source;
 use crate::{Id, Size};
 
+// 如 Type::is_anon 所示, None 会被认为是匿名, 在我们当前实现中,
+// 两个匿名会具有相同的 hash, 以及会被认定 eq. 这应该是不符合语义的.
+// 所以仅当 TypeName.is_anon() = false 时, 才能用于 HashMap.
 pub struct TypeName<'a, 'input> {
     pub namespace: Option<&'a Namespace<'input>>,
     pub name: Option<&'input str>,
@@ -33,7 +36,7 @@ impl std::fmt::Display for TypeName<'_, '_> {
     }
 }
 
-fn next_non_whitespace(iter:&mut impl Iterator<Item=char>) -> Option<char> {
+fn next_non_whitespace(iter: &mut impl Iterator<Item = char>) -> Option<char> {
     loop {
         let Some(ch) = iter.next() else {
             return None;
@@ -61,6 +64,20 @@ fn starts_with_ignore_whitespace(l: &str, r: &str) -> bool {
 }
 
 impl<'a, 'input> TypeName<'a, 'input> {
+    pub fn is_anon(&self) -> bool {
+        if self.name.is_none() {
+            return true;
+        }
+        let mut self_ns_opt = self.namespace;
+        while let Some(self_ns) = self_ns_opt {
+            if self_ns.name().is_none() {
+                return true;
+            }
+            self_ns_opt = self_ns.parent();
+        }
+        return false;
+    }
+
     pub fn try_from(ty: &'a Type<'input>) -> Option<TypeName<'a, 'input>> {
         match ty.kind() {
             TypeKind::Base(b) => Some(TypeName {

@@ -1,6 +1,6 @@
+use anyhow::ensure;
 use clap::Parser;
 use log::{info, warn};
-use anyhow::ensure;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -19,6 +19,12 @@ fn uniq_id() -> u64 {
 
 fn is_ident_char(ch: char) -> bool {
     return ch == '_' || ch.is_alphanumeric();
+}
+fn ident_part(name: &str) -> &str {
+    let Some(bad_idx) = name.find(|c|!is_ident_char(c)) else {
+        return name;
+    };
+    return &name[0..bad_idx];
 }
 
 fn consume_ident_chars(out: &mut String, input: &mut impl Iterator<Item = char>) -> Option<char> {
@@ -136,6 +142,7 @@ struct TypeIndex {
 #[derive(Debug)]
 struct TypeInfo {
     // name 可以用在 C 语言作为变量类型名.
+    // 其格式必须满足 `[struct|union|enum] 标识符[*]*`.
     name: String,
     // packed size 是使用 attribute packed 之后的 size,
     // size 为 dwarf 中记录的 type size.
@@ -144,11 +151,18 @@ struct TypeInfo {
     size: u64,
 }
 
+impl TypeInfo {
+    fn ident(&self) -> &str {
+        ident_part(self.name.split_whitespace().last().unwrap())
+    }
+}
+
 type ProcessState = HashMap<TypeIndex, Option<Rc<TypeInfo>>>;
 
 struct Printer {
     h_file: std::fs::File,
     c_file: std::fs::File,
+    used_idents: HashMap<String, u64>,
 }
 
 impl Printer {
@@ -185,7 +199,11 @@ impl Printer {
         writeln!(c_file, "{}", ASSERT_EQ_DEF)?;
         writeln!(c_file, "\n\n\n")?;
         writeln!(c_file, "int main() {{")?;
-        Ok(Printer { h_file, c_file })
+        Ok(Printer {
+            h_file,
+            c_file,
+            used_idents: HashMap::new(),
+        })
     }
 
     fn add_eq_assert(&mut self, expr: &str, size: u64) -> io::Result<()> {
@@ -198,6 +216,50 @@ impl Printer {
             self.do_add_eq_assert(&eq_assert.expr, eq_assert.val)?;
         }
         writeln!(self.c_file, "")
+    }
+
+    // 输出到 .h 文件的所有标识符, 都是经过 alloc_ident 生成的. 比如 add_type 就是如此.
+    fn alloc_ident(&mut self, tyname: &parser::TypeName) -> String {
+        // return val may be empty
+        fn get_ident_part(name: Option<&str>) -> &str {
+            name.map(|v|ident_part(v)).unwrap_or("")
+        }
+        let mut idents = 'get_idents: {
+            let mut idents = Vec::new();
+            let ident_part = get_ident_part(tyname.name);
+            if ident_part.is_empty() {
+                break 'get_idents idents;
+            }
+            idents.push(ident_part);
+
+            let mut ns_opt = tyname.namespace;
+            while let Some(ns) = ns_opt {
+                let ident = get_ident_part(ns.name());
+                if !ident.is_empty() {
+                    idents.push(ident);
+                }
+                ns_opt = ns.parent();
+            }
+            break 'get_idents idents;
+        };
+        if idents.is_empty() {
+            return format!("AnonType{}", uniq_id());
+        }
+        idents.reverse();
+
+        let mut test_idx = idents.len() - 1;
+        loop {
+            let test_ident = idents[test_idx..].join("_");
+            let Some(used) = self.used_idents.get_mut(&test_ident) else {
+                self.used_idents.insert(test_ident.clone(), 0);
+                return test_ident;
+            };
+            if test_idx == 0 {
+                *used += 1;
+                return format!("{}_{}", test_ident, *used);
+            }
+            test_idx -= 1;
+        }
     }
 
     fn add_type(&mut self, lines: &[String]) -> io::Result<()> {
@@ -447,10 +509,10 @@ fn process_union_type(
     inputs_hash: &[parser::FileHash],
     type_db: &HashMap<parser::TypeName, TypeIndex>,
 ) -> io::Result<()> {
+    let tyname = ty.type_name();
     if ty.is_declaration() {
-        let tyname = ty.type_name();
         let Some(&real_tyidx) = type_db.get(&tyname) else {
-            warn!("process_union_type: unknown declaration union. typidx={:?} typname={}", tyidx, tyname);
+            warn!("process_union_type: unknown declaration union. typidx={:?} typname={}", tyidx, &tyname);
             return Ok(());
         };
         return handle_sym_link(
@@ -548,13 +610,14 @@ fn process_union_type(
         None,
     ));
 
+    let tydef = format!("union {}", printer.alloc_ident(&tyname));
     return process_members(
         processed,
         printer,
         tyidx,
         &ty.type_name(),
         &tymems,
-        &format!("union HidvaUnion{}", uniq_id()),
+        &tydef,
         Some(ty_size),
     );
 }
@@ -568,8 +631,8 @@ fn process_struct_type(
     inputs_hash: &[parser::FileHash],
     type_db: &HashMap<parser::TypeName, TypeIndex>,
 ) -> io::Result<()> {
+    let tyname = ty.type_name();
     if ty.is_declaration() {
-        let tyname = ty.type_name();
         let Some(&real_tyidx) = type_db.get(&tyname) else {
             warn!("process_struct_type: unknown declaration struct. typidx={:?} typname={}", tyidx, tyname);
             return Ok(());
@@ -712,13 +775,14 @@ fn process_struct_type(
         }
     }
 
+    let tydef = format!("struct {}", printer.alloc_ident(&tyname));
     return process_members(
         processed,
         printer,
         tyidx,
         &ty.type_name(),
         &tymems,
-        &format!("struct HidvaStruct{}", uniq_id()),
+        &tydef,
         Some(ty_dwarf_size),
     );
 }
@@ -732,10 +796,10 @@ fn process_enum_type(
     inputs_hash: &[parser::FileHash],
     type_db: &HashMap<parser::TypeName, TypeIndex>,
 ) -> io::Result<()> {
+    let tyname = ty.type_name();
     if ty.is_declaration() {
-        let tyname = ty.type_name();
         let Some(&real_tyidx) = type_db.get(&tyname) else {
-            warn!("process_enum_type: unknown declaration. typidx={:?} typname={}", tyidx, tyname);
+            warn!("process_enum_type: unknown declaration. typidx={:?} typname={}", tyidx, &tyname);
             return Ok(());
         };
         return handle_sym_link(
@@ -790,7 +854,7 @@ fn process_enum_type(
         expr: format!("sizeof({})", ty_repr),
         val: ty_size,
     });
-    let tydef = format!("HidvaEnum{}", uniq_id());
+    let tydef = printer.alloc_ident(&tyname);
     struct_def.push(format!("// --- enum {} begin ---", &tydef));
     for enum_item in &ty.enumerators(&inputs_hash[tyidx.input_id]) {
         struct_def.push(format!(
@@ -834,11 +898,19 @@ fn process_array_type(
         return Ok(());
     };
 
+    let mem_tyident = mem_tyinfo.ident();
     let mut mem_tyname = mem_tyinfo.name.clone();
     if mem_tyinfo.size > mem_tyinfo.packed_size {
         // 以 S1218 为例, 我们在生成 S1218 是 packed 的, 但如果 S1218 作为 array element, 则
         // 需要保持其原有 padding.
-        mem_tyname = format!("struct HidvaArrayStruct{}", uniq_id());
+        mem_tyname = {
+            let name = format!("{}_Padded", mem_tyident);
+            let n = printer.alloc_ident(&parser::TypeName {
+                namespace: None,
+                name: Some(&name),
+            });
+            format!("struct {}", n)
+        };
         let mut members = Vec::<Member>::new();
         let data_name = "data";
         members.push(Member {
@@ -859,7 +931,7 @@ fn process_array_type(
             tyidx,
             &parser::TypeName {
                 namespace: None,
-                name: Some("padding struct for array"),
+                name: Some("padding struct"),
             },
             &members,
             &mem_tyname,
@@ -867,7 +939,6 @@ fn process_array_type(
         )?;
     }
 
-    let array_name = format!("HidvaArray{}", uniq_id());
     let ele_cnt = if ty_max_size == Some(0) {
         0
     } else {
@@ -893,8 +964,16 @@ fn process_array_type(
         }
         ele_count
     };
-
+    let array_name = {
+        let name = format!("{}_Array{}", mem_tyident, ele_cnt);
+        let tyname = parser::TypeName {
+            namespace: None,
+            name: Some(&name),
+        };
+        printer.alloc_ident(&tyname)
+    };
     let array_size = mem_tyinfo.size * ele_cnt;
+
     printer.add_type(&[format!(
         "typedef {} {}[{}];",
         mem_tyname, array_name, ele_cnt
@@ -959,14 +1038,8 @@ fn process_modifier_type(
                 }
             }
 
-            let real_tyinfo = get_type_info(
-                processed,
-                printer,
-                real_tyidx,
-                None,
-                inputs_hash,
-                type_db,
-            )?;
+            let real_tyinfo =
+                get_type_info(processed, printer, real_tyidx, None, inputs_hash, type_db)?;
             let real_tyname = if let Some(tyinfo) = &real_tyinfo {
                 &tyinfo.name
             } else {
@@ -1146,6 +1219,7 @@ fn main() -> anyhow::Result<()> {
                 if typ.is_anon() {
                     continue;
                 }
+                // typname.is_anon() may be true
                 type_db.insert(typname, typidx);
             }
         }
